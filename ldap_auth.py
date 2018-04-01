@@ -1,7 +1,8 @@
 import asyncio
 import bonsai
 from aiohttp import web
-from itsdangerous import JSONWebSignatureSerializer
+from itsdangerous import TimestampSigner, SignatureExpired, BadSignature
+from cryptography import fernet
 
 
 class LdapAuth:
@@ -12,12 +13,12 @@ class LdapAuth:
         'LDAP_USER_QUERY': '(userPrincipalName={})',
         'LDAP_DEFAULT_DOMAIN': 'example.com',
         'LDAP_ALLOWED_GROUPS': ("LDAP_GROUP_1", "LDAP_GROUP_2"),
-        'SECRET': '00538b8499fe823bb525ba80a8bf464a'
     }
 
     def __init__(self, loop):
         self.loop = loop
-        self.key_signer = JSONWebSignatureSerializer(self.settings['SECRET'])
+        self.secret = fernet.Fernet.generate_key()
+        self.key_signer = TimestampSigner(self.secret)
         self.client = bonsai.LDAPClient(self.settings['LDAP_SERVER'])
 
     async def authenticate(self, username=None, password=None):
@@ -56,15 +57,10 @@ class LdapAuth:
             if search:
                 if len(search) == 1:
                     ldap_user = search[0]
-                    id = self.key_signer.dumps(
-                        {
-                            'user': user,
-                            'pass': password
-                        }
-                    )
+                    id = self.key_signer.sign(user)
 
                     return {
-                        'id': str(id),
+                        'id': id.decode('ascii'),
                         'name': str(ldap_user['cn'][0]),
                         'first_name': str(ldap_user['givenName'][0]),
                         'last_name': str(ldap_user['sn'][0]),
@@ -74,16 +70,43 @@ class LdapAuth:
                     raise RuntimeError("Two users with same login")
 
     async def auth(self, request):
-        username = request.query['username']
-        password = request.query['password']
+        data = await request.post()
+
+        username = data.get('username')
+        password = data.get('password')
 
         task = await self.authenticate(username, password)
+        cookie = 'AUTH_SESSION={}; Path=/'.format(
+            task['user'].get('id')
+        )
+        headers = {'Set-Cookie': cookie}
 
-        return web.json_response(task)
+        return web.json_response(task, headers=headers)
+
+    async def check_auth(self, request):
+        cookie = request.cookies.get('AUTH_SESSION')
+
+        if not cookie:
+            return web.json_response({"auth": False})
+
+        try:
+            login = self.key_signer.unsign(cookie.encode('ascii'), max_age=36000)
+        except (SignatureExpired, BadSignature):
+            unset_cookie = 'AUTH_SESSION={}; Path=/; Expires=1;'.format(cookie)
+            headers = {'Set-Cookie': unset_cookie}
+
+            return web.json_response({"auth": False}, headers=headers)
+
+        return web.json_response({
+            "auth": True,
+            "time_left": 3600,
+            "user": login.decode('ascii')
+        })
 
     def create_app(self):
         app = web.Application(loop=self.loop)
-        app.router.add_route('GET', '/api/auth', self.auth)
+        app.router.add_route('POST', '/api/auth', self.auth)
+        app.router.add_route('GET', '/api/auth/check', self.check_auth)
 
         return app
 
